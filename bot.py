@@ -293,6 +293,8 @@ class LoginForm(StatesGroup):
     enter_profit_target = State()
     enter_custom_pattern = State()
     enter_virtual_balance = State() 
+    enter_stop_loss = State()
+    enter_stop_loss_amount = State()
 
 # ==========================================================
 # ⌨️ Keyboards
