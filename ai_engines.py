@@ -1423,6 +1423,151 @@ def adaptive_meta_ai_predict(history_docs, model_accuracies=None):
     reason = f"Cal={calibrated*100:.1f}% | Entropy={ent:.2f} | Tested={tested} | Top={top_txt}"
     return pred, f"🧠 Adaptive Meta AI {pred} ({burmese}) {dot}", conf, reason
 
+
+# ============================================================
+# 🧬 PRODUCTION ML ENSEMBLE v2
+# ------------------------------------------------------------
+# Actual scikit-learn models trained on leakage-safe lag features.
+# This is intentionally separate from the older heuristic functions
+# whose names mention LSTM/GRU/XGBoost.  No fake neural network is used.
+# Models: LogisticRegression + RandomForest + HistGradientBoosting.
+# A recent chronological validation slice determines model weights.
+# ============================================================
+_ML_V2_CACHE = {}
+
+
+def _ml_v2_make_features(values):
+    w = np.asarray(values, dtype=float)
+    feats = list(w)
+    for n in (3, 5, 8, 12, 20):
+        seg = w[-min(n, len(w)):]
+        feats += [float(np.mean(seg)),
+                  float(np.mean(seg[1:] != seg[:-1])) if len(seg) > 1 else 0.0,
+                  float(np.sum(seg[-min(3, len(seg)):])),
+                  float(np.sum(seg[-min(5, len(seg)):])),
+                  float(np.sum(seg[-min(8, len(seg)):]))]
+    return np.asarray(feats, dtype=float)
+
+
+def _ml_v2_dataset(hist, lag=20):
+    vals = np.array([1 if x == "BIG" else 0 for x in hist], dtype=float)
+    X, y = [], []
+    for i in range(lag, len(vals)):
+        # X uses ONLY results before target y[i].
+        X.append(_ml_v2_make_features(vals[i-lag:i]))
+        y.append(int(vals[i]))
+    return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
+
+def _ml_v2_fit_predict(hist):
+    # Returns probability of BIG and model validation rates.
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.pipeline import make_pipeline
+        from sklearn.metrics import accuracy_score
+    except Exception as exc:
+        return None, {}, 0, f"sklearn unavailable: {exc}"
+
+    if len(hist) < 180:
+        return None, {}, 0, "Need at least 180 historical results"
+
+    # Cache on the newest history signature; retrain only when the history changes.
+    key = (len(hist), tuple(hist[-80:]))
+    cached = _ML_V2_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    X, y = _ml_v2_dataset(hist, lag=20)
+    if len(X) < 120 or len(np.unique(y)) < 2:
+        return None, {}, len(X), "Insufficient training diversity"
+
+    # Chronological split: validation data is strictly newer than training data.
+    split = max(100, int(len(X) * 0.80))
+    if split >= len(X) - 20:
+        split = len(X) - 20
+    X_train, y_train = X[:split], y[:split]
+    X_val, y_val = X[split:], y[split:]
+
+    models = {
+        "logistic": make_pipeline(StandardScaler(), LogisticRegression(C=0.5, max_iter=500)),
+        "forest": RandomForestClassifier(
+            n_estimators=180, max_depth=7, min_samples_leaf=4,
+            random_state=42, n_jobs=1, class_weight="balanced"
+        ),
+        "hist_gradient": HistGradientBoostingClassifier(
+            max_iter=120, learning_rate=0.04, max_leaf_nodes=15,
+            l2_regularization=1.0, random_state=42
+        ),
+    }
+
+    probs = {}
+    rates = {}
+    for name, model in models.items():
+        try:
+            model.fit(X_train, y_train)
+            vp = model.predict(X_val)
+            rates[name] = float(accuracy_score(y_val, vp))
+            # Deployment feature vector: ONLY the latest known lag window.
+            vals = np.array([1 if x == "BIG" else 0 for x in hist], dtype=float)
+            X_next = _ml_v2_make_features(vals[-20:])[None, :]
+            probs[name] = float(model.predict_proba(X_next)[0, 1])
+        except Exception:
+            continue
+
+    if not probs:
+        return None, {}, len(X_val), "All ML models failed to fit"
+
+    # Validation-derived weights; neutral 0.50 performance gets weight 1.
+    weights = {name: max(0.25, 1.0 + (rate - 0.5) * 6.0) for name, rate in rates.items()}
+    total_w = sum(weights.values()) or 1.0
+    p_big = sum(probs[n] * weights[n] for n in probs) / total_w
+
+    result = (float(np.clip(p_big, 0.02, 0.98)), rates, len(X_val), "ok")
+    # Keep cache bounded.
+    if len(_ML_V2_CACHE) > 12:
+        _ML_V2_CACHE.pop(next(iter(_ML_V2_CACHE)))
+    _ML_V2_CACHE[key] = result
+    return result
+
+
+def pro_ml_v2_predict(history_docs, model_accuracies=None):
+    hist = _history_from_docs(history_docs)
+    if len(hist) < 180:
+        return "wait", "🧬 Pro ML Ensemble v2 → WAIT", 50.0, \
+               f"ML data မလုံလောက်ပါ ({len(hist)}/180)"
+
+    p_big, rates, tested, status = _ml_v2_fit_predict(hist)
+    if p_big is None:
+        return "wait", "🧬 Pro ML Ensemble v2 → WAIT", 50.0, status
+
+    # Optional live/session model accuracy is a small secondary adjustment.
+    if model_accuracies:
+        live = model_accuracies.get("pro_ml_v2", model_accuracies.get("🧬 Pro ML Ensemble v2"))
+        if live is not None:
+            live = float(np.clip(live, 0.35, 0.65))
+            p_big = 0.85 * p_big + 0.15 * (0.5 + (live - 0.5) * 2.0)
+
+    edge = abs(p_big - 0.5) * 2.0
+    avg_rate = float(np.mean(list(rates.values()))) if rates else 0.5
+
+    # Do not turn a weak probability edge into fake confidence.
+    confidence = 50.0 + edge * 38.0
+    if avg_rate < 0.50:
+        confidence -= min(8.0, (0.50 - avg_rate) * 80.0)
+    confidence = float(np.clip(confidence, 50.0, 88.0))
+
+    # Conservative WAIT gate for near-random validation or weak probability edge.
+    if avg_rate < 0.505 or edge < 0.10:
+        return "wait", "🧬 Pro ML Ensemble v2 → WAIT", confidence, \
+               f"Validation weak/edge low | Val={avg_rate*100:.1f}% | P(BIG)={p_big*100:.1f}% | N={tested}"
+
+    pred = "BIG" if p_big >= 0.5 else "SMALL"
+    burmese, dot = _label(pred)
+    model_txt = ", ".join(f"{k}:{v*100:.1f}%" for k, v in rates.items())
+    reason = f"P(BIG)={p_big*100:.1f}% | Val: {model_txt} | N={tested}"
+    return pred, f"🧬 Pro ML Ensemble v2 {pred} ({burmese}) {dot}", confidence, reason
+
 PRO_AI_MODE_NAMES = {
     "pro_lstm": "🧠 Pro LSTM",
     "pro_gru": "⚡ Pro GRU",
@@ -1438,6 +1583,7 @@ PRO_AI_MODE_NAMES = {
     "pro_adaptive": "🧠 Adaptive Meta AI",
     "babathapai": "🔮 ʙᴀʙᴀᴛʜᴀᴘᴧɪ",
     "pro_max": "👑 AI Pro Max",
+    "pro_ml_v2": "🧬 Pro ML Ensemble v2",
 }
 AI_MODE_NAMES.update(PRO_AI_MODE_NAMES)
 
@@ -1456,6 +1602,7 @@ PRO_AI_MODES = {
     "pro_adaptive": {"func": adaptive_meta_ai_predict, "name": PRO_AI_MODE_NAMES["pro_adaptive"], "desc": "Walk-forward Ensemble + Regime + Calibration + WAIT"},
     "babathapai": {"func": babathapai_predict, "name": PRO_AI_MODE_NAMES["babathapai"], "desc": "Deep Historical Memory Simulation"},
     "pro_max": {"func": pro_max_predict, "name": PRO_AI_MODE_NAMES["pro_max"], "desc": "Ultimate Pro AI Aggregator"},
+    "pro_ml_v2": {"func": pro_ml_v2_predict, "name": PRO_AI_MODE_NAMES["pro_ml_v2"], "desc": "Real sklearn ML + chronological validation + ensemble"},
 }
 AI_MODES.update(PRO_AI_MODES)
 
@@ -1464,6 +1611,8 @@ def get_prediction(history_docs, mode, user_pattern=None, model_accuracies=None)
         return custom_pattern_predict(history_docs, user_pattern)
     elif mode == "pro_dynamic":
         return pro_dynamic_ensemble_predict(history_docs, model_accuracies)
+    elif mode == "pro_ml_v2":
+        return pro_ml_v2_predict(history_docs, model_accuracies)
         
     mode_info = AI_MODES.get(mode)
     if mode_info: return mode_info["func"](history_docs)
