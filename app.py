@@ -538,9 +538,9 @@ async def process_password(message: types.Message, state: FSMContext):
             balance_text = f"{balance_val} Ks"
             
             db_user = await db.get_user(user_tg_id)
-            ai_mode = db_user.get("ai_mode", "🎯 Pattern AI") if db_user else "🎯 Pattern AI"
+            ai_mode = db_user.get("ai_mode", "🧬 Pro ML Ensemble v2") if db_user else "🧬 Pro ML Ensemble v2"
             if ai_mode not in VALID_AI_NAMES:
-                ai_mode = "🎯 Pattern AI"
+                ai_mode = "🧬 Pro ML Ensemble v2"
 
             login_time = get_myanmar_time().strftime("%Y-%m-%d %H:%M:%S")
             await db.save_user_login(user_tg_id, username, user_id, nickname, balance_text, login_time, ai_mode)
@@ -673,7 +673,7 @@ async def get_ai_prediction(user_tg_id):
         reason = result["reason"]
         display = result["display"]
         
-        user_ai_name = session_data.get("ai_mode", "PSP_AI_PREDICT")
+        user_ai_name = session_data.get("ai_mode", "🧬 Pro ML Ensemble v2")
         
         if user_ai_name == "Set Pattern":
             pat = session_data.get("custom_pattern", ["BIG"])
@@ -771,6 +771,8 @@ def update_model_accuracies(user_tg_id, actual_result_size):
         current_acc = session["model_accuracies"].get(active_ai, 0.5)
         new_acc = (current_acc * 0.8) + (1.0 if is_win else 0.0) * 0.2
         session["model_accuracies"][active_ai] = new_acc
+        if active_ai == "🧬 Pro ML Ensemble v2":
+            session["model_accuracies"]["pro_ml_v2"] = new_acc
 
 # ==========================================================
 # 🔮 AI Loops & Features
