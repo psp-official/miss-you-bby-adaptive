@@ -43,6 +43,46 @@ dp = Dispatcher(storage=storage)
 active_sessions = {}
 
 # ==========================================================
+# 🛡️ Auto-Bet Protection
+# ==========================================================
+# These are per-session settings. 0 means disabled.
+DEFAULT_STOP_LOSS = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0"))
+DEFAULT_STOP_LOSS_AMOUNT = float(os.getenv("MAX_SESSION_LOSS", "0"))
+AI_PROTECTION_CONFIDENCE = float(os.getenv("AI_PROTECTION_CONFIDENCE", "60"))
+AI_PROTECTION_LOSS_STREAK = 3
+
+def stop_loss_triggered(session: dict) -> tuple[bool, str]:
+    """Check the user's configured consecutive-loss and net-session-loss limits."""
+    lose_streak = int(session.get("current_lose_streak", 0) or 0)
+    session_profit = float(session.get("session_profit", 0.0) or 0.0)
+    virtual_profit = float(session.get("virtual_session_profit", 0.0) or 0.0)
+    current_profit = virtual_profit if session.get("is_virtual_mode", False) else session_profit
+
+    loss_limit = int(session.get("stop_loss_limit", DEFAULT_STOP_LOSS) or 0)
+    amount_limit = float(session.get("stop_loss_amount", DEFAULT_STOP_LOSS_AMOUNT) or 0)
+
+    if loss_limit > 0 and lose_streak >= loss_limit:
+        return True, f"Consecutive loss limit reached: {lose_streak}/{loss_limit}"
+
+    if amount_limit > 0 and current_profit <= -amount_limit:
+        return True, f"Session net loss limit reached: {abs(current_profit):,.2f}/{amount_limit:,.2f} Ks"
+
+    return False, ""
+
+def ai_protection_wait(session: dict, confidence: float) -> bool:
+    """When enabled, low-confidence predictions are treated as WAIT."""
+    if not session.get("ai_protection_enabled", False):
+        return False
+    try:
+        return float(confidence) < AI_PROTECTION_CONFIDENCE
+    except (TypeError, ValueError):
+        return True
+
+def ai_protection_freezes_progression(session: dict) -> bool:
+    """After 3 consecutive losses, keep the current stake instead of increasing it."""
+    return bool(session.get("ai_protection_enabled", False)) and int(session.get("current_lose_streak", 0) or 0) >= AI_PROTECTION_LOSS_STREAK
+
+# ==========================================================
 # 🌐 API Configurations
 # ==========================================================
 SITE_CONFIGS = {
@@ -128,6 +168,10 @@ TEXT_BACK = "Back"
 TEXT_VIRTUAL_MODE = "Virtual Mode"
 TEXT_REAL_MODE = "Real Mode"
 TEXT_UPLOAD_CHANNEL = "Upload Channel"
+TEXT_PROTECTION = "⚙️ Auto Bet Protection"
+TEXT_STOP_LOSS = "🛑 Stop Loss"
+TEXT_STOP_LOSS_AMOUNT = "💰 Stop Loss Amount"
+TEXT_AI_PROTECTION = "🛡️ AI Protection"
 
 E_INFO = KeyboardButton(text=TEXT_INFO, icon_custom_emoji_id="5868656545634689320", style="primary")
 E_BALANCE = KeyboardButton(text=TEXT_BALANCE, icon_custom_emoji_id="5868108575387671725", style="primary")
@@ -146,6 +190,10 @@ E_BACK = KeyboardButton(text=TEXT_BACK, icon_custom_emoji_id="584811941304143136
 E_VIRTUAL = KeyboardButton(text=TEXT_VIRTUAL_MODE, icon_custom_emoji_id="5807868868886009920", style="primary")
 E_REAL = KeyboardButton(text=TEXT_REAL_MODE, icon_custom_emoji_id="5868656545634689320", style="primary")
 E_UPLOAD = KeyboardButton(text=TEXT_UPLOAD_CHANNEL, icon_custom_emoji_id="5890997763331591703", style="primary")
+E_PROTECTION = KeyboardButton(text=TEXT_PROTECTION, icon_custom_emoji_id="5877260593903177342", style="primary")
+E_STOP_LOSS = KeyboardButton(text=TEXT_STOP_LOSS, icon_custom_emoji_id="5807461353799030682", style="danger")
+E_STOP_LOSS_AMOUNT = KeyboardButton(text=TEXT_STOP_LOSS_AMOUNT, icon_custom_emoji_id="5807461353799030682", style="primary")
+E_AI_PROTECTION = KeyboardButton(text=TEXT_AI_PROTECTION, icon_custom_emoji_id="5807868868886009920", style="primary")
 
 P_1 = '<tg-emoji emoji-id="5890997763331591703">⚙️</tg-emoji>'
 P_2 = '<tg-emoji emoji-id="5875180111744995604">⚙️</tg-emoji>'
@@ -270,6 +318,7 @@ def get_logged_in_keyboard():
             [E_GAMES, E_AI],
             [E_BETSIZE, E_PROFIT],
             [E_HIT, E_PREDICT],
+            [E_PROTECTION],
             [E_VIRTUAL, E_REAL],
             [E_UPLOAD, E_LOGOUT]
         ],
@@ -296,6 +345,21 @@ def get_upload_toggle_keyboard():
 
 def get_cancel_keyboard():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Cancel")]], resize_keyboard=True)
+
+def get_protection_keyboard(session: dict):
+    sl = int(session.get("stop_loss_limit", 0) or 0)
+    sla = float(session.get("stop_loss_amount", 0) or 0)
+    aip = bool(session.get("ai_protection_enabled", False))
+    ai_text = "🟢 AI Protection ON" if aip else "🔴 AI Protection OFF"
+    ai_style = "success" if aip else "danger"
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [E_STOP_LOSS, E_STOP_LOSS_AMOUNT],
+            [KeyboardButton(text=ai_text, icon_custom_emoji_id="5807868868886009920", style=ai_style)],
+            [E_BACK]
+        ],
+        resize_keyboard=True
+    )
 
 def get_ai_mode_keyboard():
     standard_modes = [m for k, m in AI_MODES.items() if not k.startswith("pro_") and k != "babathapai"]
@@ -538,9 +602,9 @@ async def process_password(message: types.Message, state: FSMContext):
             balance_text = f"{balance_val} Ks"
             
             db_user = await db.get_user(user_tg_id)
-            ai_mode = db_user.get("ai_mode", "🧬 Pro ML Ensemble v2") if db_user else "🧬 Pro ML Ensemble v2"
+            ai_mode = db_user.get("ai_mode", "🎯 Pattern AI") if db_user else "🎯 Pattern AI"
             if ai_mode not in VALID_AI_NAMES:
-                ai_mode = "🧬 Pro ML Ensemble v2"
+                ai_mode = "🎯 Pattern AI"
 
             login_time = get_myanmar_time().strftime("%Y-%m-%d %H:%M:%S")
             await db.save_user_login(user_tg_id, username, user_id, nickname, balance_text, login_time, ai_mode)
@@ -559,6 +623,16 @@ async def process_password(message: types.Message, state: FSMContext):
                 "session_profit": 0.0, 
                 "hit_wait": 0, 
                 "current_misses": 0, 
+                "current_win_streak": 0,
+                "current_lose_streak": 0,
+                "longest_win_streak": 0,
+                "longest_lose_streak": 0,
+                "stop_loss_triggered": False,
+                "stop_loss_limit": DEFAULT_STOP_LOSS,
+                "stop_loss_amount": DEFAULT_STOP_LOSS_AMOUNT,
+                "ai_protection_enabled": False,
+                "ai_protection_confidence": AI_PROTECTION_CONFIDENCE,
+                "ai_protection_frozen": False,
                 "is_ai_prediction_enabled": False, 
                 "last_predicted_issue": None,
                 "is_virtual_mode": False, 
@@ -596,7 +670,7 @@ async def get_latest_game_result(target_issue, user_tg_id):
     config = SITE_CONFIGS.get(site)
     url = f"{config['api_url']}/GetNoaverageEmerdList"
     
-    payload = {'pageSize': 10, 'pageNo': 1, 'typeId': type_id, 'language': 7}
+    payload = {'pageSize': 100, 'pageNo': 1, 'typeId': type_id, 'language': 7}
     headers = get_headers(site, token)
     signed_payload = get_signed_payload(payload)
     
@@ -620,11 +694,6 @@ async def get_latest_game_result(target_issue, user_tg_id):
 # 🧠 GET AI PREDICTION (PSP_AI_PREDICT Version)
 # ==========================================================
 async def get_ai_prediction(user_tg_id):
-    """
-    PSP_AI_PREDICT ကို အသုံးပြု၍ ခန့်မှန်းချက် ရယူခြင်း
-    - Database မှ နောက်ဆုံး 5000 ပွဲစာကို ဆွဲယူမည်
-    - Pattern အလိုက် ခန့်မှန်းချက် ထုတ်ပေးမည်
-    """
     session_data = active_sessions.get(user_tg_id, {})
     if not session_data:
         return None, 0, None, None
@@ -636,10 +705,7 @@ async def get_ai_prediction(user_tg_id):
     config = SITE_CONFIGS.get(site)
     url = f"{config['api_url']}/GetNoaverageEmerdList"
     
-    # ==========================================================
-    # 1️⃣ API မှ နောက်ဆုံးပွဲစဉ် ရယူခြင်း (နောက်ပွဲစဉ် သိရန်)
-    # ==========================================================
-    payload = {'pageSize': 1000, 'pageNo': 1, 'typeId': type_id, 'language': 7}
+    payload = {'pageSize': 100, 'pageNo': 1, 'typeId': type_id, 'language': 7}
     headers = get_headers(site, token)
     signed_payload = get_signed_payload(payload)
 
@@ -652,54 +718,37 @@ async def get_ai_prediction(user_tg_id):
         if not records:
             return None, 0, None, None
             
-        # နောက်ဆုံးထွက်ပွဲနှင့် နောက်ပွဲစဉ်
         last_completed_issue = records[0]['issueNumber']
         next_issue = str(int(last_completed_issue) + 1)
         
-        # ==========================================================
-        # 2️⃣ Database ထဲသို့ ရလဒ်အသစ်များ သိမ်းဆည်းခြင်း
-        # ==========================================================
         for item in records:
             num = int(item['number'])
             size_text = "BIG" if num >= 5 else "SMALL"
             await db.save_game_record(site, type_id, item['issueNumber'], num, size_text)
         
-        # ==========================================================
-        # 3️⃣ Database မှ သမိုင်းကြောင်း (History) ဆွဲယူခြင်း
-        # ==========================================================
         db_records = await db.get_game_history(site, type_id, limit=5000)
         
-        # History list ကို ပြင်ဆင်ခြင်း (နောက်ဆုံးထွက်ပွဲမှ စ၍)
         history_list = []
         for item in db_records:
             history_list.append(item['size'])
         
-        # Database မှ ဒေတာမရပါက API မှရထားသော ဒေတာကို သုံးမည်
         if not history_list:
             for item in records:
                 num = int(item['number'])
                 size_text = "BIG" if num >= 5 else "SMALL"
                 history_list.append(size_text)
         
-        # ==========================================================
-        # 4️⃣ PSP_AI_PREDICT ကို ခေါ်သုံးခြင်း
-        # ==========================================================
-        # AI Engine မှ pattern prediction ကို ရယူခြင်း
         from ai_engines import psp_ai_predict
         
         result = psp_ai_predict(history_list)
         
-        predicted_size = result["prediction"]  # "BIG" or "SMALL"
-        confidence = result["confidence"]      # 55.0 - 85.0
-        reason = result["reason"]              # အကြောင်းပြချက်
-        display = result["display"]            # "BIG (အကြီး) 🔴" or "SMALL (အသေး) 🟢"
+        predicted_size = result["prediction"]
+        confidence = result["confidence"]
+        reason = result["reason"]
+        display = result["display"]
         
-        # ==========================================================
-        # 5️⃣ AI Mode အလိုက် ခန့်မှန်းချက် (Default အနေဖြင့် PSP_AI_PREDICT သုံးမည်)
-        # ==========================================================
-        user_ai_name = session_data.get("ai_mode", "🧬 Pro ML Ensemble v2")
+        user_ai_name = session_data.get("ai_mode", "PSP_AI_PREDICT")
         
-        # Set Pattern ဆိုပါက user သတ်မှတ်ထားသော pattern ကို သုံးမည်
         if user_ai_name == "Set Pattern":
             pat = session_data.get("custom_pattern", ["BIG"])
             step = session_data.get("custom_pattern_step", 0)
@@ -714,7 +763,6 @@ async def get_ai_prediction(user_tg_id):
                     
             return target_bet.lower(), 100, next_issue, user_ai_name
         
-        # ကျန်သော AI Modes များအတွက် ai_engines.py မှ ရယူမည်
         elif user_ai_name != "PSP_AI_PREDICT":
             mode_key = "pattern"
             for key, val in ai_engines.AI_MODES.items():
@@ -722,18 +770,14 @@ async def get_ai_prediction(user_tg_id):
                     mode_key = key
                     break
             
-            # Model အစစ်ခေါ်ယူခြင်း
             model_acc = session_data.get("model_accuracies", {})
             predicted_size, _, confidence, _ = ai_engines.get_prediction(
-                history_docs=db_records,  # ဒေတာကို doc format အတိုင်း ပေးရန်
+                history_docs=db_records,
                 mode=mode_key,
                 model_accuracies=model_acc
             )
             return predicted_size.lower(), confidence, next_issue, user_ai_name
         
-        # ==========================================================
-        # 6️⃣ PSP_AI_PREDICT ရလဒ်ကို ပြန်ပေးခြင်း
-        # ==========================================================
         return predicted_size.lower(), confidence, next_issue, user_ai_name
         
     except Exception as e:
@@ -801,8 +845,6 @@ def update_model_accuracies(user_tg_id, actual_result_size):
         current_acc = session["model_accuracies"].get(active_ai, 0.5)
         new_acc = (current_acc * 0.8) + (1.0 if is_win else 0.0) * 0.2
         session["model_accuracies"][active_ai] = new_acc
-        if active_ai == "🧬 Pro ML Ensemble v2":
-            session["model_accuracies"]["pro_ml_v2"] = new_acc
 
 # ==========================================================
 # 🔮 AI Loops & Features
@@ -853,7 +895,7 @@ async def prediction_broadcast_loop(user_tg_id, message: types.Message):
                 if gn == "WINGO_1M":
                     await asyncio.sleep(30)
                 elif gn == "WINGO_30S":
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                     
                 active_sessions[user_tg_id]["last_predicted_issue"] = issue
                 active_sessions[user_tg_id]["last_prediction_value"] = pred
@@ -863,10 +905,10 @@ async def prediction_broadcast_loop(user_tg_id, message: types.Message):
                 
                 txt = (
                     f"<blockquote>\n"
-                    f"{P_1} Ai Prediction - Live\n"
-                    f"{P_2} {gn} : <code>{issue}</code>\n"
-                    f"{P_3} Prediction : <b>{pred.upper()}</b> 〔 {lw} 〕|〔 {ll} 〕\n"
-                    f"{P_4} Status : Waiting...\n"
+                    f"☉ Ai Prediction - Live\n"
+                    f"☉ {gn} : <code>{issue}</code>\n"
+                    f"☉ Prediction : <b>{pred.upper()}</b> 〔 {lw} 〕|〔 {ll} 〕\n"
+                    f"☉ Status : Waiting...\n"
                     f"</blockquote>"
                 )
                 pred_msg = await message.answer(txt)
@@ -892,19 +934,19 @@ async def prediction_broadcast_loop(user_tg_id, message: types.Message):
                     update_model_accuracies(user_tg_id, actual)
                     
                     if pred.lower() == actual:
-                        stat = f"{P_5}WIN{res}"
+                        stat = f"✔WIN{res}"
                         active_sessions[user_tg_id]["current_win_streak"] += 1
                         active_sessions[user_tg_id]["current_lose_streak"] = 0
                         new_max_win = max(active_sessions[user_tg_id]["longest_win_streak"], active_sessions[user_tg_id]["current_win_streak"])
                         active_sessions[user_tg_id]["longest_win_streak"] = new_max_win
                     else:
-                        stat = f"{P_6} LOSE{res}"
+                        stat = f"✖LOSE{res}"
                         active_sessions[user_tg_id]["current_lose_streak"] += 1
                         active_sessions[user_tg_id]["current_win_streak"] = 0
                         new_max_lose = max(active_sessions[user_tg_id]["longest_lose_streak"], active_sessions[user_tg_id]["current_lose_streak"])
                         active_sessions[user_tg_id]["longest_lose_streak"] = new_max_lose
                 else:
-                    stat = "⚖️ DRAW"
+                    stat = "DRAW"
                 
                 lw = active_sessions[user_tg_id]["longest_win_streak"]
                 ll = active_sessions[user_tg_id]["longest_lose_streak"]
@@ -912,10 +954,10 @@ async def prediction_broadcast_loop(user_tg_id, message: types.Message):
                 try:
                     ftxt = (
                         f"<blockquote>\n"
-                        f"{P_1} Ai Prediction - Live\n"
-                        f"{P_2} {gn} : <code>{issue}</code>\n"
-                        f"{P_3} Prediction : <b>{pred.upper()}</b> 〔 {lw} 〕|〔 {ll} 〕\n"
-                        f"{P_4} Status : {stat}\n"
+                        f"☉ Ai Prediction - Live\n"
+                        f"☉ {gn} : <code>{issue}</code>\n"
+                        f"☉ Prediction : <b>{pred.upper()}</b> 〔 {lw} 〕|〔 {ll} 〕\n"
+                        f"☉ Status : {stat}\n"
                         f"</blockquote>"
                     )
                     await pred_msg.edit_text(ftxt)
@@ -936,13 +978,16 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
     is_virtual = session.get("is_virtual_mode", False)
     gn = session.get("game_type_name", "WINGO_30S")
     
-    # ==========================================
-    # 📊 Streak Tracking Variables
-    # ==========================================
     current_win_streak = 0
     current_lose_streak = 0
     longest_win_streak = 0
     longest_lose_streak = 0
+    session["current_win_streak"] = 0
+    session["current_lose_streak"] = 0
+    session["longest_win_streak"] = 0
+    session["longest_lose_streak"] = 0
+    session["stop_loss_triggered"] = False
+    session["ai_protection_frozen"] = False
     total_bets = 0
     total_wins = 0
     total_losses = 0
@@ -954,17 +999,31 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
 
     while active_sessions.get(user_tg_id, {}).get("is_auto_betting", False):
         try:
-            pred, _, issue, ai_name = await get_ai_prediction(user_tg_id)
+            pred, confidence, issue, ai_name = await get_ai_prediction(user_tg_id)
             
             if issue and issue != last_issue:
                 if gn == "WINGO_1M":
                     await asyncio.sleep(30)
                     
+                if ai_protection_wait(session, confidence) and pred not in (None, "wait"):
+                    msg_txt = (
+                        f"<blockquote>\n"
+                        f"🛡️ AI Protection: <b>WAIT</b>\n"
+                        f"☉ {gn} : <code>{issue}</code>\n"
+                        f"☉ Confidence: <b>{float(confidence):.1f}%</b> &lt; {AI_PROTECTION_CONFIDENCE:.0f}%\n"
+                        f"</blockquote>"
+                    )
+                    msg = await message.answer(msg_txt)
+                    last_issue = issue
+                    asyncio.create_task(delete_message_later(msg, 7))
+                    await asyncio.sleep(2)
+                    continue
+
                 if pred == "wait":
                     msg_txt = (
                         f"<blockquote>\n"
-                        f"{E_DOC} Trigger စောင့်နေပါသည်\n"
-                        f"{E_DOC} {gn} : <code>{issue}</code>\n"
+                        f"☉ Trigger စောင့်နေပါသည်\n"
+                        f"☉ {gn} : <code>{issue}</code>\n"
                         f"</blockquote>"
                     )
                     msg = await message.answer(msg_txt)
@@ -979,9 +1038,9 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                 if hw > 0 and cm < hw:
                     hit_txt = (
                         f"<blockquote>\n"
-                        f"{E_DOC} Hit Wait: {cm}/{hw}\n"
-                        f"{E_DOC} {gn} : <code>{issue}</code>\n"
-                        f"{E_FLOWER} Pred: {pred.upper()}\n"
+                        f"☉ Hit Wait: {cm}/{hw}\n"
+                        f"☉ {gn} : <code>{issue}</code>\n"
+                        f"☉ Pred: {pred.upper()}\n"
                         f"</blockquote>"
                     )
                     msg = await message.answer(hit_txt)
@@ -1001,7 +1060,7 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                         
                         if pred.lower() == actual:
                             active_sessions[user_tg_id]["current_misses"] = 0
-                            await msg.edit_text(f"🔄 AI အမှန်ခန့်မှန်း (Reset)\nResult: {res}")
+                            await msg.edit_text(f"AI အမှန်ခန့်မှန်း (Reset)\nResult: {res}")
                         elif actual != "?": 
                             active_sessions[user_tg_id]["current_misses"] += 1
                             if active_sessions[user_tg_id]["current_misses"] >= hw:
@@ -1034,28 +1093,32 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                             c_bal = float(c_bal_raw)
                 
                 if c_bal < amt:
-                    await message.answer("⚠️ လက်ကျန်ငွေမလုံလောက်ပါ။ Stop.")
+                    await message.answer("လက်ကျန်ငွေမလုံလောက်ပါ။")
                     active_sessions[user_tg_id]["is_auto_betting"] = False
                     break
 
                 active_sessions[user_tg_id]["last_prediction_value"] = pred
                 bet_txt = (
                     f"<blockquote>\n"
-                    f"{E_DOC} {gn} : <code>{issue}</code>\n"
-                    f"{E_DOC} {ai_name}\n"
-                    f"{E_FLOWER} Pred: <b>{pred.upper()}</b> | {amt} Ks\n"
+                    f"☉ {gn} : <code>{issue}</code>\n"
+                    f"☉ {ai_name}\n"
+                    f"☉ Pred: <b>{pred.upper()}</b> | {amt} Ks\n"
                     f"</blockquote>"
                 )
                 await message.answer(bet_txt)
                 last_issue = issue
                 await asyncio.sleep(7) 
 
+                # ✅ FIX: Virtual Mode မှာ Random မသုံးတော့ပါ။ API Real Data ကိုသာ စောင့်ယူမည်။
                 if is_virtual:
                     res = await get_latest_game_result(issue, user_tg_id)
-                    if res == "? | ?":
-                        rand_num = random.randint(0, 9)
-                        rand_size = 'BIG' if rand_num >= 5 else 'SMALL'
-                        res = f"{rand_num} | {rand_size}"
+                    for _ in range(45):
+                        if not active_sessions.get(user_tg_id, {}).get("is_auto_betting"):
+                            break 
+                        if res != "? | ?":
+                            break
+                        await asyncio.sleep(2)
+                        res = await get_latest_game_result(issue, user_tg_id)
                 else: 
                     success = await place_auto_bet(user_tg_id, issue, pred, amt, True)
                     if not success:
@@ -1097,9 +1160,8 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                     total_bets += 1
                     
                     if pred.lower() == actual:
-                        # ========== WIN ==========
                         prof = amt * 0.96
-                        stat = f"{E_SETTING} <b>WIN</b> {E_CROWN} +{prof} Ks"
+                        stat = f"☉ <b>WIN</b> ✔ +{prof} Ks"
                         
                         if is_virtual:
                             session["virtual_session_profit"] += prof
@@ -1108,10 +1170,12 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                             
                         active_sessions[user_tg_id]["current_bet_step"] = 0
                         active_sessions[user_tg_id]["current_misses"] = 0
+                        session["ai_protection_frozen"] = False
                         
-                        # ✅ Streak Update
                         current_win_streak += 1
                         current_lose_streak = 0
+                        session["current_win_streak"] = current_win_streak
+                        session["current_lose_streak"] = current_lose_streak
                         total_wins += 1
                         
                         if current_win_streak > longest_win_streak:
@@ -1120,19 +1184,24 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                     elif actual == "?":
                         stat = "⚙️ DRAW (Pending)"
                     else:
-                        # ========== LOSE ==========
-                        stat = f"{E_SETTING} <b>LOSE</b> {E_LOSS} {amt} Ks"
+                        stat = f"☉ <b>LOSE</b> ✖ {amt} Ks"
                         
                         if is_virtual:
                             session["virtual_session_profit"] -= amt
                         else:
                             active_sessions[user_tg_id]["session_profit"] -= amt
                             
-                        active_sessions[user_tg_id]["current_bet_step"] = (step + 1) % len(seq)
-                        
-                        # ❌ Streak Update
                         current_lose_streak += 1
+                        # AI Protection: after 3 consecutive losses, freeze the current stake.
+                        if session.get("ai_protection_enabled", False) and current_lose_streak >= AI_PROTECTION_LOSS_STREAK:
+                            session["ai_protection_frozen"] = True
+                            active_sessions[user_tg_id]["current_bet_step"] = step
+                        else:
+                            active_sessions[user_tg_id]["current_bet_step"] = (step + 1) % len(seq)
+                        
                         current_win_streak = 0
+                        session["current_lose_streak"] = current_lose_streak
+                        session["current_win_streak"] = current_win_streak
                         total_losses += 1
                         
                         if current_lose_streak > longest_lose_streak:
@@ -1154,10 +1223,10 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                         f"<blockquote>\n"
                         f"{stat}\n"
                         f"───────────────\n"
-                        f"{E_GRID} {gn} : <code>{issue}</code>\n"
-                        f"{E_GRID} Result: <code>{res}</code>\n"
-                        f"{E_EDIT} Bal: K{n_bal:,.2f} 〔{longest_win_streak} | {longest_lose_streak}〕\n"
-                        f"{E_EDIT} Total Profit: {c_prof:,.2f} Ks\n"
+                        f"☉ {gn} : <code>{issue}</code>\n"
+                        f"☉ Result: <code>{res}</code>\n"
+                        f"☉ Bal: K{n_bal:,.2f} 〔{longest_win_streak} | {longest_lose_streak}〕\n"
+                        f"☉ Total Profit: {c_prof:,.2f} Ks\n"
                         f"</blockquote>"
                     )
                     
@@ -1165,6 +1234,22 @@ async def auto_bet_loop(user_tg_id, message: types.Message):
                     
                     if not is_virtual:
                         await db.update_user_balance(user_tg_id, f"{n_bal:.2f} Ks")
+
+                    # 🛑 NEW STOP-LOSS: evaluate only after a confirmed result.
+                    # This prevents the bot from stopping on a pending/unknown round.
+                    triggered, stop_reason = stop_loss_triggered(session)
+                    if triggered:
+                        session["stop_loss_triggered"] = True
+                        session["is_auto_betting"] = False
+                        await message.answer(
+                            f"🛑 <b>AUTO-BET STOP-LOSS TRIGGERED</b>\n"
+                            f"☉ {gn} : <code>{issue}</code>\n"
+                            f"☉ {stop_reason}\n"
+                            f"☉ Current Profit: {c_prof:,.2f} Ks\n"
+                            f"☉ Auto-Bet: <b>STOPPED</b>\n"
+                            f"\nပြန်စရန် <b>Start Auto-Bet</b> ကို နှိပ်ပါ။"
+                        )
+                        break
                         
                     profit_target = session.get("profit_target", 0)
                     if profit_target > 0 and c_prof >= profit_target:
@@ -1310,6 +1395,91 @@ async def process_bet_seq(msg: types.Message, state: FSMContext):
     except Exception:
         await msg.answer("❌ မှားယွင်းနေပါသည်။ ဥပမာ: 10-20-40")
 
+@dp.message(F.text == TEXT_PROTECTION)
+async def btn_protection(msg: types.Message):
+    user_id = msg.from_user.id
+    if user_id not in active_sessions:
+        await msg.answer("Login ဝင်ပေးပါ။")
+        return
+    s = active_sessions[user_id]
+    sl = int(s.get("stop_loss_limit", 0) or 0)
+    sla = float(s.get("stop_loss_amount", 0) or 0)
+    aip = "ON" if s.get("ai_protection_enabled", False) else "OFF"
+    await msg.answer(
+        "⚙️ <b>Auto Bet Protection</b>\n\n"
+        f"🛑 Stop Loss: <b>{sl if sl else 'OFF'}</b> consecutive losses\n"
+        f"💰 Stop Loss Amount: <b>{sla:,.2f} Ks</b>" + ("" if sla else " <b>OFF</b>") + "\n"
+        f"🛡️ AI Protection: <b>{aip}</b>\n\n"
+        f"AI Protection ON → confidence &lt; {AI_PROTECTION_CONFIDENCE:.0f}% = WAIT; 3 losses = stake freeze; WIN = reset.",
+        reply_markup=get_protection_keyboard(s)
+    )
+
+@dp.message(F.text == TEXT_STOP_LOSS)
+async def btn_stop_loss(msg: types.Message, state: FSMContext):
+    if msg.from_user.id not in active_sessions:
+        return
+    await state.set_state(LoginForm.enter_stop_loss)
+    current = int(active_sessions[msg.from_user.id].get("stop_loss_limit", 0) or 0)
+    await msg.answer(f"🛑 Stop Loss လက်ရှိ: <b>{current or 'OFF'}</b>\n\nဆက်တိုက်ရှုံးမည့်အကြိမ်အရေအတွက်ကို ရိုက်ပါ။\nဥပမာ <code>5</code>\n<code>0</code> = OFF", reply_markup=get_cancel_keyboard())
+
+@dp.message(LoginForm.enter_stop_loss)
+async def process_stop_loss(msg: types.Message, state: FSMContext):
+    if msg.text.lower() == "cancel":
+        await state.set_state(LoginForm.main_menu)
+        await msg.answer("❌ Cancelled", reply_markup=get_logged_in_keyboard())
+        return
+    try:
+        value = int(msg.text.strip())
+        if value < 0 or value > 1000:
+            raise ValueError
+        active_sessions[msg.from_user.id]["stop_loss_limit"] = value
+        await state.set_state(LoginForm.main_menu)
+        await msg.answer(f"✅ Stop Loss = <b>{value if value else 'OFF'}</b> consecutive losses", reply_markup=get_logged_in_keyboard())
+    except ValueError:
+        await msg.answer("❌ 0 သို့မဟုတ် အပေါင်းကိန်းတစ်ခု ရိုက်ပါ။ ဥပမာ: 5")
+
+@dp.message(F.text == TEXT_STOP_LOSS_AMOUNT)
+async def btn_stop_loss_amount(msg: types.Message, state: FSMContext):
+    if msg.from_user.id not in active_sessions:
+        return
+    await state.set_state(LoginForm.enter_stop_loss_amount)
+    current = float(active_sessions[msg.from_user.id].get("stop_loss_amount", 0) or 0)
+    await msg.answer(f"💰 Stop Loss Amount လက်ရှိ: <b>{current:,.2f} Ks</b>" + ("" if current else " <b>OFF</b>") + "\n\nSession net loss အများဆုံးပမာဏကို ရိုက်ပါ။\nဥပမာ <code>5000</code>\n<code>0</code> = OFF", reply_markup=get_cancel_keyboard())
+
+@dp.message(LoginForm.enter_stop_loss_amount)
+async def process_stop_loss_amount(msg: types.Message, state: FSMContext):
+    if msg.text.lower() == "cancel":
+        await state.set_state(LoginForm.main_menu)
+        await msg.answer("❌ Cancelled", reply_markup=get_logged_in_keyboard())
+        return
+    try:
+        value = float(msg.text.strip())
+        if value < 0 or value > 1000000000:
+            raise ValueError
+        active_sessions[msg.from_user.id]["stop_loss_amount"] = value
+        await state.set_state(LoginForm.main_menu)
+        await msg.answer(f"✅ Stop Loss Amount = <b>{value:,.2f} Ks</b>" + (" <b>(OFF)</b>" if value == 0 else ""), reply_markup=get_logged_in_keyboard())
+    except ValueError:
+        await msg.answer("❌ 0 သို့မဟုတ် အပေါင်းငွေပမာဏ ရိုက်ပါ။ ဥပမာ: 5000")
+
+@dp.message(F.text.in_({TEXT_AI_PROTECTION, "🟢 AI Protection ON", "🔴 AI Protection OFF"}))
+async def btn_ai_protection(msg: types.Message):
+    user_id = msg.from_user.id
+    if user_id not in active_sessions:
+        return
+    s = active_sessions[user_id]
+    s["ai_protection_enabled"] = not s.get("ai_protection_enabled", False)
+    if not s["ai_protection_enabled"]:
+        s["ai_protection_frozen"] = False
+    state_text = "🟢 ENABLED" if s["ai_protection_enabled"] else "🔴 DISABLED"
+    await msg.answer(
+        f"🛡️ AI Protection: <b>{state_text}</b>\n"
+        f"• Confidence &lt; {AI_PROTECTION_CONFIDENCE:.0f}% → WAIT\n"
+        f"• 3 consecutive losses → stake increase FREEZE\n"
+        f"• WIN → loss streak/protection freeze reset",
+        reply_markup=get_protection_keyboard(s)
+    )
+
 @dp.message(F.text == TEXT_START)
 async def btn_start(msg: types.Message):
     user_id = msg.from_user.id
@@ -1349,7 +1519,12 @@ async def btn_status(msg: types.Message):
             f"🤖 AI: {s.get('ai_mode')}\n"
             f"⚙️ Seq: {seq_str} (Step {step_str})\n"
             f"💰 Bal: {bal_val:.2f}\n"
-            f"📈 Profit: {prof_val:.2f}"
+            f"📈 Profit: {prof_val:.2f}\n"
+            f"🛑 Stop-Loss: {s.get('stop_loss_limit', 0) or 'OFF'} consecutive losses\n"
+            f"💰 Stop-Loss Amount: {s.get('stop_loss_amount', 0):,.2f} Ks" + (" (OFF)" if not s.get('stop_loss_amount', 0) else "") + "\n"
+            f"🛡️ AI Protection: {'ON' if s.get('ai_protection_enabled') else 'OFF'}" +
+            (f"\n⛔ Triggered: {s.get('stop_loss_triggered', False)}" if s.get('stop_loss_triggered') else "") +
+            (f"\n🧊 Stake Freeze: ON ({AI_PROTECTION_LOSS_STREAK}+ losses)" if s.get('ai_protection_frozen') else "")
         )
         await msg.answer(txt)
 
